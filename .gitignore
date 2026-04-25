@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.local
+
+# Data & cache (do not commit raw market data or computed outputs)
+data/
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Backgrounded process output
+nohup.out
+
+# Local logs
+*.log
+/tmp/spx_run*.log
+/tmp/spy_*_run.log
