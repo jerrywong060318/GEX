@@ -126,13 +126,13 @@ async def fetch_snapshot_quote(
     snapshot_day: date,
     snapshot_ns: int,
     n_probe: int = 50,
-) -> float | None:
-    """Get the mid of the latest valid quote at or before `snapshot_ns`.
+) -> tuple[float, float] | None:
+    """Get the (bid, ask) of the latest valid quote at or before `snapshot_ns`.
 
     Makes a single targeted REST call — `timestamp.lte=<snapshot_ns>`,
     `order=desc`, `limit=n_probe` — instead of paginating the whole day.
-    Filters to rows with bid > 0 and ask > 0 and returns the mid of the
-    most recent one. Returns None if no valid quote exists.
+    Filters to rows with bid > 0 and ask > 0 and returns the most recent one.
+    Returns None if no valid quote exists.
 
     Caches a single-row parquet per (contract, day) so subsequent runs
     skip the network.
@@ -142,7 +142,9 @@ async def fetch_snapshot_quote(
     if cached is not None:
         if cached.is_empty():
             return None
-        return float(cached["mid"][0])
+        if "bid" in cached.columns and "ask" in cached.columns:
+            return (float(cached["bid"][0]), float(cached["ask"][0]))
+        # stale cache with old "mid" schema — fall through to re-fetch
 
     payload = await client.get(
         f"/v3/quotes/{option_ticker}",
@@ -154,24 +156,25 @@ async def fetch_snapshot_quote(
         },
     )
     rows = payload.get("results") or []
-    mid: float | None = None
+    result: tuple[float, float] | None = None
     for row in rows:
         bid = row.get("bid_price")
         ask = row.get("ask_price")
         if bid is not None and ask is not None and bid > 0 and ask > 0:
-            mid = (float(bid) + float(ask)) / 2.0
+            result = (float(bid), float(ask))
             break
 
     # Cache the scalar result (one row, or empty if none found).
-    if mid is None:
+    if result is None:
         storage.write_parquet(
-            pl.DataFrame(schema={"mid": pl.Float64}), cache_path,
+            pl.DataFrame(schema={"bid": pl.Float64, "ask": pl.Float64}), cache_path,
         )
     else:
+        bid, ask = result
         storage.write_parquet(
-            pl.DataFrame({"mid": [mid]}), cache_path,
+            pl.DataFrame({"bid": [bid], "ask": [ask]}), cache_path,
         )
-    return mid
+    return result
 
 
 async def fetch_quotes(

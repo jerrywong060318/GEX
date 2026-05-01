@@ -20,28 +20,32 @@ Writes:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import asyncio
 import logging
-import resource
+# import resource
 import time
 from datetime import date, timedelta
 
 import polars as pl
 
 
-def _raise_fd_limit(target: int = 4096) -> None:
-    """Raise the process file-descriptor soft limit for high concurrency.
+# def _raise_fd_limit(target: int = 4096) -> None:
+#     """Raise the process file-descriptor soft limit for high concurrency.
 
-    macOS defaults to 256 soft / 10240 hard. We need ~2× MAX_CONCURRENT_REQUESTS
-    plus headroom for cache parquet files, stdio, etc.
-    """
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    desired = max(soft, min(target, hard))
-    if desired > soft:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+#     macOS defaults to 256 soft / 10240 hard. We need ~2× MAX_CONCURRENT_REQUESTS
+#     plus headroom for cache parquet files, stdio, etc.
+#     """
+#     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+#     desired = max(soft, min(target, hard))
+#     if desired > soft:
+#         resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
 
 
-_raise_fd_limit(4096)
+# _raise_fd_limit(4096)
 
 from config import (
     CLASSIFICATION_MODE,
@@ -71,7 +75,7 @@ from src import flatfiles
 from src.contracts import fetch_contracts_expiring_on, filter_by_strike_band
 from src.dividends import fetch_dividends, skip_dates
 from src.gex import aggregate_daily, compute_contract_gex
-from src.greeks import implied_vol_and_gamma
+from src.iv_gamma import compute_iv_gamma
 from src.snapshot import (
     fetch_treasury_yields,
     risk_free_rate,
@@ -144,13 +148,13 @@ async def accumulate_mm_position(
     return float(sum(per_day)), len(sessions)
 
 
-async def snapshot_option_mid(
+async def snapshot_option_bid_ask(
     client: PolygonClient,
     option_ticker: str,
     snapshot_day: date,
     snapshot_et,
-) -> float | None:
-    """Option mid at the snapshot instant.
+) -> tuple[float, float] | None:
+    """Option (bid, ask) at the snapshot instant.
 
     Uses a single targeted REST call (`timestamp.lte=<snapshot_ns>`,
     `order=desc`, `limit=50`) to avoid pulling the whole day of quotes
@@ -280,8 +284,8 @@ async def process_day(
                 return None
 
             in_flight[option_ticker] = (c_t0, "snapshot quote")
-            mid = await snapshot_option_mid(client, option_ticker, day, snapshot_et)
-            if mid is None:
+            bid_ask = await snapshot_option_bid_ask(client, option_ticker, day, snapshot_et)
+            if bid_ask is None:
                 progress_counter["skipped"] += 1
                 logger.info(
                     "%s [%d/%d] %s K=$%.2f: no valid quote at snapshot, skipping",
@@ -289,12 +293,12 @@ async def process_day(
                 )
                 return None
 
+            bid, ask = bid_ask
+            mid = (bid + ask) / 2.0
             in_flight[option_ticker] = (c_t0, "solving IV")
-            is_call = kind == "call"
-            greeks = implied_vol_and_gamma(
-                spot=spot, strike=strike, T=T, r=r, mid=mid, is_call=is_call,
-            )
-            if greeks is None:
+            flag = "C" if kind == "call" else "P"
+            result = compute_iv_gamma(bid, ask, spot, strike, T, r, 0.0, flag)
+            if result.sigma is None:
                 progress_counter["skipped"] += 1
                 logger.info(
                     "%s [%d/%d] %s K=$%.2f: IV solver failed, skipping",
@@ -305,14 +309,14 @@ async def process_day(
             progress_counter["priced"] += 1
             total_elapsed = time.perf_counter() - c_t0
             gex = (
-                mm_position * greeks.gamma
+                mm_position * result.gamma
                 * int(row["shares_per_contract"] or 100) * spot ** 2
             )
             logger.info(
                 "%s [%d/%d] %s K=$%.2f: done in %.1fs — "
                 "mm=%+d, mid=$%.3f, IV=%.1f%%, Γ=%.5f, GEX=%+.3g",
                 day, idx, total, kind, strike, total_elapsed,
-                int(mm_position), mid, greeks.iv * 100, greeks.gamma, gex,
+                int(mm_position), mid, result.sigma * 100, result.gamma, gex,
             )
 
             return {
@@ -326,8 +330,8 @@ async def process_day(
                 "T_years": T,
                 "r": r,
                 "mid": mid,
-                "iv": greeks.iv,
-                "gamma": greeks.gamma,
+                "iv": result.sigma,
+                "gamma": result.gamma,
                 "mm_position": mm_position,
             }
         finally:

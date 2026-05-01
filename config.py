@@ -16,7 +16,7 @@ TICKER: str = "SPY"
 # --- Date range (inclusive) ---
 # 2-year backtest. Effective end date is capped at the latest published
 # flat-file day at run-time (see run_backtest.py).
-START_DATE: date = date(2024, 1, 1)
+START_DATE: date = date(2026, 4, 1)
 END_DATE: date = date(2026, 4, 23)
 
 # --- Contract filter ---
