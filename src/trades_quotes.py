@@ -1,8 +1,3 @@
-"""Option trades & quotes: fetch per day, classify initiative direction.
-
-sum_mm_position()
-    Extended to exclude block trades and flagged algo prints before summing.
-"""
 from __future__ import annotations
 
 import logging
@@ -73,26 +68,39 @@ _EXCLUDE_CONDITIONS: frozenset[int] = frozenset({
 # TWAP / VWAP ALGO DETECTION PARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ALGO_WINDOW      = 6     # sliding window (trades). 10 is too wide for thin
-                          # SPY 0DTE contracts with only ~15-50 trades/day.
-_ALGO_SIZE_CV_MAX = 0.20  # max size coefficient of variation (uniform = TWAP)
-_ALGO_TIME_CV_MAX = 0.35  # max gap coefficient of variation (regular = TWAP)
-_ALGO_MIN_TRADES  = 5     # minimum trades before algo detection runs
+_ALGO_WINDOW         = 6     # sliding window (trades). 10 is too wide for thin
+                             # SPY 0DTE contracts with only ~15-50 trades/day.
+_ALGO_SIZE_CV_MAX    = 0.20  # max size CV for TWAP detection (uniform sizes)
+_ALGO_TIME_CV_MAX    = 0.35  # max gap CV for TWAP detection (regular timing)
+_ALGO_MIN_TRADES     = 5     # minimum trades before algo detection runs
+_VWAP_PRICE_TOL      = 0.001 # VWAP: max allowed deviation from rolling VWAP
+                             # as a fraction of VWAP price (0.1%)
+_VWAP_MIN_CLUSTER    = 0.85  # VWAP: fraction of window trades that must sit
+                             # within _VWAP_PRICE_TOL of the window VWAP
 
 
 def flag_algo_trades(trades: pl.DataFrame) -> pl.DataFrame:
-    """Detect TWAP-style algorithmically split orders.
+    """Detect TWAP-style and VWAP-style algorithmically split orders.
 
-    Slides a window of _ALGO_WINDOW trades across the time-sorted sequence.
-    Flags the entire window when:
+    Slides a window of _ALGO_WINDOW trades across the time-sorted sequence
+    and flags any window that matches either pattern:
+
+    TWAP pattern (equal slices at regular intervals):
         1. Trade sizes are suspiciously uniform: CV(sizes) < _ALGO_SIZE_CV_MAX
         2. Inter-trade gaps are suspiciously regular: CV(gaps) < _ALGO_TIME_CV_MAX
 
-    This catches TWAP execution (split into equal-sized tranches at regular
-    intervals). VWAP detection is not implemented here — see module docstring.
+    VWAP pattern (trades clustering around the volume-weighted price):
+        VWAP = sum(price * size) / sum(size) for the window.
+        Flag if >= _VWAP_MIN_CLUSTER fraction of trades in the window
+        have prices within _VWAP_PRICE_TOL (0.3%) of that VWAP.
+        Logic: a VWAP algo targets the volume-weighted average — so its
+        fills land tightly around that anchor regardless of trade size.
+        Unlike TWAP, sizes are NOT uniform; the clustering is in price
+        space around the running VWAP.
 
     Args:
-        trades: DataFrame with sip_timestamp (Int64) and size (Float64) columns.
+        trades: DataFrame with sip_timestamp (Int64), price (Float64),
+                and size (Float64) columns.
 
     Returns:
         Same DataFrame with boolean is_algo_trade column added.
@@ -100,41 +108,51 @@ def flag_algo_trades(trades: pl.DataFrame) -> pl.DataFrame:
     if trades.is_empty() or len(trades) < _ALGO_MIN_TRADES:
         return trades.with_columns(pl.lit(False).alias("is_algo_trade"))
 
-    df       = trades.sort("sip_timestamp")
-    sizes    = df["size"].to_list()
-    ts_vals  = df["sip_timestamp"].to_list()
-    n        = len(sizes)
-    flags    = [False] * n
-    window   = min(_ALGO_WINDOW, n)
+    df      = trades.sort("sip_timestamp")
+    prices  = df["price"].to_list()
+    sizes   = df["size"].to_list()
+    ts_vals = df["sip_timestamp"].to_list()
+    n       = len(sizes)
+    flags   = [False] * n
+    window  = min(_ALGO_WINDOW, n)
 
     for start in range(n - window + 1):
-        end      = start + window
-        w_sizes  = sizes[start:end]
-        w_ts     = ts_vals[start:end]
+        end     = start + window
+        w_p     = prices[start:end]
+        w_s     = sizes[start:end]
+        w_ts    = ts_vals[start:end]
 
-        # ── size uniformity ──────────────────────────────────────────────────
-        mean_s = sum(w_sizes) / window
-        if mean_s <= 0:
-            continue
-        var_s = sum((s - mean_s) ** 2 for s in w_sizes) / window
-        cv_s  = var_s ** 0.5 / mean_s
-        if cv_s > _ALGO_SIZE_CV_MAX:
-            continue
+        # ── TWAP check: uniform sizes + regular gaps ─────────────────────────
+        mean_s = sum(w_s) / window
+        if mean_s > 0:
+            var_s = sum((s - mean_s) ** 2 for s in w_s) / window
+            cv_s  = var_s ** 0.5 / mean_s
 
-        # ── timing regularity ────────────────────────────────────────────────
-        gaps   = [w_ts[i + 1] - w_ts[i] for i in range(window - 1)]
-        if not gaps or min(gaps) <= 0:
-            continue
-        mean_g = sum(gaps) / len(gaps)
-        if mean_g <= 0:
-            continue
-        var_g = sum((g - mean_g) ** 2 for g in gaps) / len(gaps)
-        cv_g  = var_g ** 0.5 / mean_g
-        if cv_g > _ALGO_TIME_CV_MAX:
-            continue
+            if cv_s <= _ALGO_SIZE_CV_MAX:
+                gaps = [w_ts[i + 1] - w_ts[i] for i in range(window - 1)]
+                if gaps and min(gaps) > 0:
+                    mean_g = sum(gaps) / len(gaps)
+                    if mean_g > 0:
+                        var_g = sum((g - mean_g) ** 2 for g in gaps) / len(gaps)
+                        cv_g  = var_g ** 0.5 / mean_g
+                        if cv_g <= _ALGO_TIME_CV_MAX:
+                            for i in range(start, end):
+                                flags[i] = True
+                            continue   # already flagged, skip VWAP check
 
-        for i in range(start, end):
-            flags[i] = True
+        # ── VWAP check: trades clustering around rolling VWAP ────────────────
+        total_vol = sum(w_s)
+        if total_vol <= 0:
+            continue
+        vwap = sum(p * s for p, s in zip(w_p, w_s)) / total_vol
+        if vwap <= 0:
+            continue
+        n_near_vwap = sum(
+            1 for p in w_p if abs(p - vwap) / vwap <= _VWAP_PRICE_TOL
+        )
+        if n_near_vwap / window >= _VWAP_MIN_CLUSTER:
+            for i in range(start, end):
+                flags[i] = True
 
     return df.with_columns(
         pl.Series("is_algo_trade", flags, dtype=pl.Boolean)
